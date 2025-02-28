@@ -1,3 +1,4 @@
+import cedalion
 import cedalion_parcellation.datasets as datasets
 import cedalion_parcellation.imagereco.forward_model as fw
 import cedalion.io as io
@@ -34,7 +35,8 @@ def load_Adot( path_to_dataset = None, head_model = 'ICBM152' ):
     # with open(os.path.join(path_to_dataset, 'derivatives', 'fw',  head_model, 'Adot_wParcels.pkl'), 'rb') as f:
     #     Adot = pickle.load(f)
     
-    with open(path_to_dataset + head_model + '/Adot_wParcels.pkl', 'rb') as f:
+    file_path = os.path.join(path_to_dataset, head_model, 'Adot_wParcels.pkl')
+    with open(file_path, 'rb') as f:
         Adot = pickle.load(f) 
         
     #% LOAD HEAD MODEL 
@@ -62,9 +64,10 @@ def load_Adot( path_to_dataset = None, head_model = 'ICBM152' ):
 
 
 
-
-def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wavelength = [760,850], BRAIN_ONLY = False, SB = False, sb_cfg = None, alpha_spatial_list = [1e-3], alpha_meas_list = [1e-3], file_save = False, file_path = None, trial_type_img = None, W = None, C = None, D = None  ):
-
+def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wavelength = [760,850], cfg_img_recon = None, trial_type_img = None, save_path = None, W = None, C = None, D = None  ):
+    
+    cfg_sb = cfg_img_recon['cfg_sb']
+    
     print( 'Starting Image Reconstruction')
 
     #
@@ -82,7 +85,7 @@ def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wave
         pruning_mask = ~(hrf_od.sel(wavelength=wav[0]).mean('time').isnull() | hrf_od.sel(wavelength=wav[1]).mean('time').isnull())
 
     if C_meas is None:
-        if BRAIN_ONLY:
+        if cfg_img_recon['BRAIN_ONLY']:
             Adot_pruned = Adot[pruning_mask.values, Adot.is_brain.values, :] 
         else:
             Adot_pruned = Adot[pruning_mask.values, :, :]
@@ -99,7 +102,7 @@ def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wave
         
     else: # don't prune anything if C_meas is not None as we use C_meas to essentially prune
           # but we make sure the corresponding elements of C_meas are set to BAD values
-        if BRAIN_ONLY:
+        if cfg_img_recon['BRAIN_ONLY']:
             Adot_pruned = Adot[:, Adot.is_brain.values, :] 
         else:
             Adot_pruned = Adot
@@ -142,15 +145,15 @@ def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wave
     #
     # spatial basis functions
     #
-    if SB:
-        M = sbf.get_sensitivity_mask(Adot_pruned, sb_cfg['mask_threshold'])
+    if cfg_img_recon['SB']:
+        M = sbf.get_sensitivity_mask(Adot_pruned, cfg_sb['mask_threshold'])
 
         G = sbf.get_G_matrix(head,     # spatial basis functions
                                 M,
-                                sb_cfg['threshold_brain'], 
-                                sb_cfg['threshold_scalp'], 
-                                sb_cfg['sigma_brain'], 
-                                sb_cfg['sigma_scalp']
+                                cfg_sb['threshold_brain'], 
+                                cfg_sb['threshold_scalp'], 
+                                cfg_sb['sigma_brain'], 
+                                cfg_sb['sigma_scalp']
                                 )
         
         nbrain = Adot_pruned.is_brain.sum().values
@@ -187,9 +190,9 @@ def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wave
     # Ensure A is a numpy array
     A = np.array(A)
 
-    for alpha_spatial in alpha_spatial_list:
+    for alpha_spatial in cfg_img_recon['alpha_spatial_list']:
                         
-        if not BRAIN_ONLY and W is None and C is None and D is None:
+        if not cfg_img_recon['BRAIN_ONLY'] and W is None and C is None and D is None:
 
             print( f'   Doing spatial regularization with alpha_spatial = {alpha_spatial}')
             # GET A_HAT
@@ -214,12 +217,12 @@ def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wave
         else:
             f = max(np.diag(C))
             
-        for alpha_meas in alpha_meas_list:
+        for alpha_meas in cfg_img_recon['alpha_meas_list']:
             
             print(f'   Doing image recon with alpha_meas = {alpha_meas}')
             
 
-            if BRAIN_ONLY and W is None:
+            if cfg_img_recon['BRAIN_ONLY'] and W is None:
                 Adot_stacked = xr.DataArray(A, dims=("flat_channel", "flat_vertex"))
                 W = pseudo_inverse_stacked(Adot_stacked, alpha=alpha_meas)
                 W = W.assign_coords({"chromo" : ("flat_vertex", ["HbO"]*nvertices  + ["HbR"]* nvertices)})
@@ -242,7 +245,7 @@ def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wave
             
             split = len(X)//2
 
-            if BRAIN_ONLY:
+            if cfg_img_recon['BRAIN_ONLY']:
                 if len(hrf_od.dims) == 2: # not a time series else it is a time series
                     X = xr.DataArray(X, 
                                     dims = ('vertex'),
@@ -264,7 +267,7 @@ def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wave
                                         )
                 
             else:
-                if SB:
+                if cfg_img_recon['SB']:
                     X_hbo = X[:split]
                     X_hbr = X[split:]
                     sb_X_brain_hbo = X_hbo[:nkernels_brain]
@@ -320,15 +323,16 @@ def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wave
                                         )
                     X = X.set_xindex("parcel")
 
-
+            
+            # !!! SHOULD we also save W, C, D, C_meas?????
             # save the results
-            if file_save:
+            if cfg_img_recon['flag_save_img_results']:
                 if C_meas is None:
-                    filepath = os.path.join(file_path, f'X_{trial_type_img}_alpha_spatial_{alpha_spatial:.0e}_alpha_meas_{alpha_meas:.0e}.pkl.gz')
-                    print(f'   Saving to X_{trial_type_img}_alpha_spatial_{alpha_spatial:.0e}_alpha_meas_{alpha_meas:.0e}.pkl.gz')
+                    filepath = os.path.join(save_path, f'X_{trial_type_img.values}_alpha_spatial_{alpha_spatial:.0e}_alpha_meas_{alpha_meas:.0e}.pkl.gz')
+                    print(f'   Saving to X_{trial_type_img.values}_alpha_spatial_{alpha_spatial:.0e}_alpha_meas_{alpha_meas:.0e}.pkl.gz \n')
                 else:
-                    filepath = os.path.join(file_path, f'X_{trial_type_img}_cov_alpha_spatial_{alpha_spatial:.0e}_alpha_meas_{alpha_meas:.0e}.pkl.gz')
-                    print(f'   Saving to X_{trial_type_img}_cov_alpha_spatial_{alpha_spatial:.0e}_alpha_meas_{alpha_meas:.0e}.pkl.gz')
+                    filepath = os.path.join(save_path, f'X_{trial_type_img.values}_cov_alpha_spatial_{alpha_spatial:.0e}_alpha_meas_{alpha_meas:.0e}.pkl.gz')
+                    print(f'   Saving to X_{trial_type_img.values}_cov_alpha_spatial_{alpha_spatial:.0e}_alpha_meas_{alpha_meas:.0e}.pkl.gz \n')
                 file = gzip.GzipFile(filepath, 'wb')
                 file.write(pickle.dumps([X, alpha_meas, alpha_spatial]))
                 file.close()     
@@ -339,8 +343,58 @@ def do_image_recon( hrf_od = None, head = None, Adot = None, C_meas = None, wave
     return X, W, C, D
 
 
+def img_noise_tstat(X_grp, W, C_meas):
+    ''' Calculate tstat and image noise of X_grp.
+    
+    Inputs:
+        X_grp : image result of group average done in channel space
+        W : pseudo inverse matrix
+        Cmeas : variance (y_stderr_weighted**2)
+    
+    Outputs:
+        X_noise : image noise
+        X_tstat : iamge t-stat (i.e. CNR)
+    '''
+    
+    # scale columns of W by y_stderr_weighted**2
+    cov_img_tmp = W * np.sqrt(C_meas.values) # W is pseudo inverse  --- diagonal (faster than W C W.T)
+    cov_img_diag = np.nansum(cov_img_tmp**2, axis=1)
 
-def plot_image_recon( X, head, shape, iax, flag_hbx='hbo_brain', view_position='superior', p0 = None, title_str = None ):
+    nV = X_grp.shape[0]
+    cov_img_diag = np.reshape( cov_img_diag, (2,nV) ).T
+
+    # image noise
+    X_noise = X_grp.copy()
+    X_noise.values = np.sqrt(cov_img_diag)
+    
+    
+    # image t-stat (i.e. CNR)
+    X_tstat = X_grp / np.sqrt(cov_img_diag)
+
+    X_tstat[ np.where(cov_img_diag[:,0]==0)[0], 0 ] = 0
+    X_tstat[ np.where(cov_img_diag[:,1]==0)[0], 1 ] = 0
+    
+    return X_noise, X_tstat
+
+
+
+def save_image_results(X_matrix, X_matrix_name, save_path, trial_type_img, cfg_img_recon):
+    '''Save image result matrices.
+    Inputs:
+        X_matrix : resulat mat you wanna save (i.e. X_noise)
+        X_matrix_name (str) : nam eof matric you are saving
+        
+    '''
+    # !!! NOTE: only saves last elem in alpha lists... what if the list is > 1?
+    filepath = os.path.join(save_path, f'{X_matrix_name}_{trial_type_img.values}_cov_alpha_spatial_{cfg_img_recon["alpha_spatial_list"][-1]:.0e}_alpha_meas_{cfg_img_recon["alpha_meas_list"][-1]:.0e}.pkl.gz')
+    print(f'   Saving to {X_matrix_name}_{trial_type_img.values}_cov_alpha_spatial_{cfg_img_recon["alpha_spatial_list"][-1]:.0e}_alpha_meas_{cfg_img_recon["alpha_meas_list"][-1]:.0e}.pkl.gz \n')
+    file = gzip.GzipFile(filepath, 'wb')
+    file.write(pickle.dumps([X_matrix, cfg_img_recon["alpha_meas_list"][-1], cfg_img_recon["alpha_spatial_list"][-1]]))
+    file.close()  
+    
+
+
+def plot_image_recon( X, head, shape, iax,clim=(0,1), flag_hbx='hbo_brain', view_position='superior', p0 = None, title_str = None, off_screen= True ):
     # pos_names = ['superior', 'left']
 
     #
@@ -374,7 +428,7 @@ def plot_image_recon( X, head, shape, iax, flag_hbx='hbo_brain', view_position='
         (96., 115., 165.),
         (0,0,1)]
     ]
-    clim=(-X_hbo_brain.max(), X_hbo_brain.max())
+    #clim=(-X_hbo_brain.max(), X_hbo_brain.max())
 
     # get index of pos_names that matches view_position
     idx = [i for i, s in enumerate(pos_names) if view_position in s]
@@ -382,7 +436,7 @@ def plot_image_recon( X, head, shape, iax, flag_hbx='hbo_brain', view_position='
     pos = positions[idx[0]]
 
     if p0 is None:
-        p0 = pv.Plotter(off_screen=True, shape=(shape[0],shape[1]), window_size = [2000, 1500])
+        p0 = pv.Plotter(shape=(shape[0],shape[1]), window_size = [2000, 1500], off_screen=off_screen)
 #        p.add_text(f"Group average with alpha_meas = {alpha_meas} and alpha_spatial = {alpha_spatial}", position='upper_left', font_size=12, viewport=True)
 
     p0.subplot(iax[0], iax[1])

@@ -56,6 +56,12 @@ def load_and_preprocess( cfg_dataset, cfg_preprocess, cfg_dqr ):
     der_dir = os.path.join(cfg_dataset['root_dir'], 'derivatives', 'plots')
     if not os.path.exists(der_dir):
         os.makedirs(der_dir)
+    der_dir = os.path.join(cfg_dataset['root_dir'], 'derivatives', 'plots', 'IMG')
+    if not os.path.exists(der_dir):
+        os.makedirs(der_dir)
+    der_dir = os.path.join(cfg_dataset['root_dir'], 'derivatives', 'plots', 'DQR')
+    if not os.path.exists(der_dir):
+        os.makedirs(der_dir)
     der_dir = os.path.join(cfg_dataset['root_dir'], 'derivatives', 'ica')
     if not os.path.exists(der_dir):
         os.makedirs(der_dir)
@@ -299,6 +305,9 @@ def preprocess(rec, median_filt ):
 
 
 def pruneChannels( rec, cfg_prune ):
+    ''' Function that prunes channels based on cfg params.
+        *Pruned channels are not dropped, instead they are set to NaN 
+        '''
 
     amp_threshs = cfg_prune['amp_threshs']
     snr_thresh = cfg_prune['snr_thresh']

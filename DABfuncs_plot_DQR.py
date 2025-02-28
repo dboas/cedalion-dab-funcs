@@ -35,9 +35,9 @@ def plotDQR( rec = None, chs_pruned = None, slope = None, filenm = None, filepat
     ax[0][0].plot( rec.aux_ts["gvtd"].time, rec.aux_ts["gvtd_tddr"], color='#ff4500', label="GVTD TDDR")
     ax[0][0].set_xlabel("time / s")
     ax[0][0].set_title(f"{filenm}")
-    thresh = quality.find_gvtd_thresh(rec.aux_ts['gvtd'].values, quality.gvtd_stat_type.Histogram_Mode, n_std = 10)
+    thresh = quality._get_gvtd_threshold(rec.aux_ts['gvtd'].values, quality.stat_type.Histogram_Mode, n_std = 10)
     ax[0][0].axhline(thresh, color='b', linestyle='--', label=f'Thresh {thresh:.1e}')
-    thresh_tddr = quality.find_gvtd_thresh(rec.aux_ts['gvtd_tddr'].values, quality.gvtd_stat_type.Histogram_Mode, n_std = 10)
+    thresh_tddr = quality._get_gvtd_threshold(rec.aux_ts['gvtd_tddr'].values, quality.gvtd_stat_type.Histogram_Mode, n_std = 10)
     ax[0][0].axhline(thresh_tddr, color='#ff4500', linestyle='--', label=f'Thresh {thresh_tddr:.1e}')
     ax[0][0].legend()
 
@@ -148,20 +148,20 @@ def plotDQR( rec = None, chs_pruned = None, slope = None, filenm = None, filepat
     # give a title to the figure
     p.suptitle(filenm)
 
-    p.savefig( os.path.join(filepath, 'derivatives', 'plots', filenm + "_DQR.png") )
+    p.savefig( os.path.join(filepath, 'derivatives', 'plots', 'DQR', filenm + "_DQR.png") )
     p.close()
 
     # Plot the GVTD Histograms
     #thresh = pfDAB.find_gvtd_thresh(rec[idx_file].aux_ts['gvtd'].values, statType, nStd)
     thresh = quality.make_gvtd_hist(rec.aux_ts['gvtd'].values, plot_thresh=True, stat_type=quality.gvtd_stat_type.Histogram_Mode, n_std=10)
     p.suptitle(filenm)
-    p.savefig( os.path.join(filepath, 'derivatives', 'plots', filenm + "_DQR_gvtd_hist.png") )
+    p.savefig( os.path.join(filepath, 'derivatives', 'plots', 'DQR', filenm + "_DQR_gvtd_hist.png") )
     p.close()
 
     # #thresh = pfDAB.find_gvtd_thresh(rec[idx_file].aux_ts['gvtd_tddr'].values, statType, nStd)
     thresh_tddr = quality.make_gvtd_hist(rec.aux_ts['gvtd_tddr'].values, plot_thresh=True, stat_type=quality.gvtd_stat_type.Histogram_Mode, n_std=10)
     p.suptitle(filenm)
-    p.savefig( os.path.join(filepath, 'derivatives', 'plots', filenm + "_DQR_gvtd_hist_tddr.png") )
+    p.savefig( os.path.join(filepath, 'derivatives', 'plots', 'DQR', filenm + "_DQR_gvtd_hist_tddr.png") )
     p.close()
 
 
@@ -324,7 +324,7 @@ def plotDQR_sidecar(file_json, rec, filepath, filenm):
     # give a title to the figure
     p.suptitle(filenm)
 
-    p.savefig( os.path.join(filepath, 'derivatives', 'plots', filenm + "_DQR_sigVdis.png") )
+    p.savefig( os.path.join(filepath, 'derivatives', 'plots', 'DQR', filenm + "_DQR_sigVdis.png") )
     p.close()
 
 
@@ -398,7 +398,7 @@ def plotDQR_sidecar(file_json, rec, filepath, filenm):
     # give a title to the figure
     p.suptitle(filenm)
 
-    p.savefig( os.path.join(filepath, 'derivatives', 'plots', filenm + "_DQR_calib.png") )
+    p.savefig( os.path.join(filepath, 'derivatives', 'plots', 'DQR', filenm + "_DQR_calib.png") )
     p.close()
 
 
@@ -428,7 +428,7 @@ def plotDQR_sidecar(file_json, rec, filepath, filenm):
     # give a title to the figure
     p.suptitle(filenm)
 
-    p.savefig( os.path.join(filepath, 'derivatives', 'plots', filenm + "_DQR_crosstalk.png") )
+    p.savefig( os.path.join(filepath, 'derivatives', 'plots', 'DQR', filenm + "_DQR_crosstalk.png") )
     p.close()
 
 
@@ -662,7 +662,7 @@ def plot_tIncCh_dqr( rec, filepath, filenm_lst, iqr_threshold_std=2, iqr_thresho
             # give a title to the figure and save it
             filenm = filenm_lst[subj_idx][file_idx]
             p.suptitle(filenm)
-            p.savefig( os.path.join(filepath, 'derivatives', 'plots', filenm + '_DQR_tIncCh.png') )
+            p.savefig( os.path.join(filepath, 'derivatives', 'plots', 'DQR', filenm + '_DQR_tIncCh.png') )
 #            p.close()
 
             if flag_plot:
@@ -770,7 +770,7 @@ def plot_group_dqr( n_subjects, n_files_per_subject, chs_pruned_subjs, slope_bas
     dirnm = os.path.basename(os.path.normpath(filepath))
     p.suptitle(f'Data set - {dirnm}')
 
-    p.savefig( os.path.join(filepath, 'derivatives', 'plots', "DQR_group.png") )
+    p.savefig( os.path.join(filepath, 'derivatives', 'plots', 'DQR', "DQR_group.png") )
     
     if flag_plot:
         p.show()

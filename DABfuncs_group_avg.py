@@ -29,7 +29,7 @@ def get_group_avg_for_diff_conds(rec, rec_str_lst, flag_save_weighted, chs_prune
     
     Inputs: 
         rec : list of recording objects for each subject
-        rec_str_lst : list strings identifying data arrays in rec you want to average
+        rec_str_lst : list of strings identifying data arrays in rec you want to average
         flag_save_weighted : list (same size as rec_str_lst) that indicates 
             whether to save the weighted or unweighted for each data array in rec_str_lst
     '''
@@ -125,8 +125,7 @@ def run_group_block_average( rec, rec_str, chs_pruned_subjs, cfg_dataset, cfg_bl
             # select the stim for the given file
             stim = rec[subj_idx][file_idx].stim.copy()
             
-            # !!! ADD if conc and flag_do_GLM then run glm func
-
+            # GLM filtering step
             if 'chromo' in conc_filt.dims and cfg_blockavg['flag_do_GLM_filter']:
                 rec_glm = GLM(rec[subj_idx][file_idx], rec_str, cfg_blockavg['trange_hrf'][0], cfg_blockavg['trange_hrf'][1], cfg_GLM)
                 conc_filt = rec_glm[rec_str]
@@ -173,14 +172,10 @@ def run_group_block_average( rec, rec_str, chs_pruned_subjs, cfg_dataset, cfg_bl
 
         # get MSE for weighting across subjects
         
-        # FIXME: this at the moment assumes all epochs are the same trial_type
-        #        so we need one trial type and flag_save_each_subj=False
+
         blockaverage_weighted = blockaverage.copy()
-        #blockaverage_mean_weighted = blockaverage.copy()
         n_epochs = conc_epochs.shape[0]
         n_chs = conc_epochs.shape[2]
-
-        # # FIXME: start of solution for more than one trial_type   
         
         mse_t_lst = []
         mse_t_o_lst = []
@@ -202,7 +197,7 @@ def run_group_block_average( rec, rec_str, chs_pruned_subjs, cfg_dataset, cfg_bl
             mse_t[idx_amp,:] = mse_val_for_bad_data
             mse_t[idx_amp + n_chs,:] = mse_val_for_bad_data
 
-            # blockaverage_weighted[0,0,idx_amp,:] = blockaverage_val # FIXME: first dimension is trial_type
+            # blockaverage_weighted[0,0,idx_amp,:] = blockaverage_val 
             # blockaverage_weighted[0,1,idx_amp,:] = blockaverage_val 
             
             # Update bad data with predetermined value
@@ -214,7 +209,7 @@ def run_group_block_average( rec, rec_str, chs_pruned_subjs, cfg_dataset, cfg_bl
             idx_sat = np.where(chs_pruned_subjs[subj_idx][file_idx] == 0.0)[0] 
             mse_t[idx_sat,:] = mse_val_for_bad_data
             mse_t[idx_sat + n_chs,:] = mse_val_for_bad_data
-            # blockaverage_weighted[0,0,idx_sat,:] = blockaverage_val # FIXME: first dimension is trial_type
+            # blockaverage_weighted[0,0,idx_sat,:] = blockaverage_val 
             # blockaverage_weighted[0,1,idx_sat,:] = blockaverage_val 
             
             bad_vals = blockaverage_weighted.isel(channel=idx_sat)
@@ -293,8 +288,9 @@ def run_group_block_average( rec, rec_str, chs_pruned_subjs, cfg_dataset, cfg_bl
             blockaverage_subj = xr.concat([blockaverage_subj, blockaverage_subj_tmp], dim='subj')
 
             blockaverage_mse_subj_tmp = mse_t_o.expand_dims('subj')
+            
             blockaverage_mse_subj_tmp = blockaverage_mse_subj_tmp.assign_coords(subj=[subj_ids[subj_idx]])
-            blockaverage_mse_subj = xr.concat([blockaverage_mse_subj, blockaverage_mse_subj_tmp], dim='subj')
+            blockaverage_mse_subj = xr.concat([blockaverage_mse_subj, blockaverage_mse_subj_tmp], dim='subj') # !!! this does not have trial types
 
 
             blockaverage_mean_weighted += blockaverage_weighted / mse_t
@@ -306,6 +302,8 @@ def run_group_block_average( rec, rec_str, chs_pruned_subjs, cfg_dataset, cfg_bl
         
         # DONE LOOP OVER SUBJECTS
 
+        #pdb.set_trace()
+        
     # get the average
     blockaverage_mean = blockaverage_subj.mean('subj')
     
@@ -546,6 +544,10 @@ def GLM(rec, rec_str, t_pre, t_post, cfg_GLM):
     
 
     return rec
+
+    
+
+
 
 #%% Old funcs
 
