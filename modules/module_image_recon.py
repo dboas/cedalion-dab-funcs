@@ -1,6 +1,6 @@
 import cedalion
-import cedalion_parcellation.datasets as datasets
-import cedalion_parcellation.imagereco.forward_model as fw
+import cedalion.datasets as datasets
+import cedalion.imagereco.forward_model as fw
 import cedalion.io as io
 import cedalion.nirs as nirs
 import xarray as xr
