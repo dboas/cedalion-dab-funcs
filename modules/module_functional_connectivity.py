@@ -3,10 +3,10 @@ import cedalion.nirs
 import cedalion.sigproc.quality as quality
 import cedalion.sigproc.frequency as frequency
 import cedalion.xrutils as xrutils
-import cedalion.datasets as datasets
+#import cedalion.datasets as datasets
 import xarray as xr
 import matplotlib.pyplot as p
-import cedalion.plots as plots
+import cedalion.vis as plots
 from cedalion import units
 import numpy as np
 
@@ -16,6 +16,11 @@ from scipy.spatial.distance import squareform
 import module_image_recon as img_recon 
 import module_spatial_basis_funs_ced as sbf 
 
+from cedalion.sigproc.physio import global_component_subtract
+#from cedalion.sigproc.quality import measurement_variance
+
+from statsmodels.robust.robust_linear_model import RLM
+from statsmodels.robust.norms import TukeyBiweight
 
 
 def getCorrMatrix( conc_hbo = None, flag_GMS = "all" ):
@@ -211,11 +216,79 @@ def corr_cluster( corr_matrix_xr, cluster_threshold ):
 
 
 
+def global_preweight(innov_matrix, kappa=4.685):
+    """
+    Compute Tukey-bisquare weights across all channels jointly.
+    innov_matrix: shape (n_channels, n_time)
+    Returns: weights w_t of shape (n_time,)
+    """
+    # geometric length per timepoint
+    r = np.sqrt(np.sum(innov_matrix**2, axis=0))
+    med = np.median(r)
+    mad = np.median(np.abs(r - med))
+    sigma = 1.4826 * mad
+    if sigma == 0:
+        return np.ones_like(r)
+    w = np.where(np.abs(r) < kappa * sigma,
+                 (1 - (r / (kappa * sigma))**2)**2,
+                 0.0)
+    return w
+
+def robust_slope(x, y, weights=None):
+    """
+    Compute robust slope of y ~ x using Tukey bisquare weighting.
+    Optionally apply global preweights (multiplicative).
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    # combine with global preweights
+    if weights is not None:
+        w = weights
+    else:
+        w = np.ones_like(x)
+    # Add constant term
+    X = np.column_stack([np.ones_like(x), x])
+    # Apply global weights
+    model = RLM(y, X, M=TukeyBiweight(), weights=w)
+    res = model.fit(maxiter=50)
+    return res.params[1]  # slope only
+
+def robust_corr_pair(x, y, global_weights=None):
+    """Compute symmetric robust correlation coefficient for one pair."""
+    beta_xy = robust_slope(x, y, weights=global_weights)
+    beta_yx = robust_slope(y, x, weights=global_weights)
+    sign = np.sign(beta_xy + beta_yx)  # correct sign convention
+    r_robust = sign * np.sqrt(np.abs(beta_xy * beta_yx))
+    return r_robust
+
+def robust_pearson_corrcoef(data, global_w):
+    """
+    Robust correlation following Lanka et al. (2022).
+    data: xarray.DataArray or np.ndarray, shape (n_channels, n_time)
+    Returns: np.ndarray (n_channels, n_channels)
+    """
+    if isinstance(data, xr.DataArray):
+        arr = data.values
+    else:
+        arr = np.asarray(data)
+    n_channels, n_time = arr.shape
+
+    # Pairwise robust correlations
+    R = np.eye(n_channels)
+    for i in range(n_channels):
+        for j in range(i+1, n_channels):
+            r = robust_corr_pair(arr[i], arr[j], global_weights=global_w)
+            R[i, j] = R[j, i] = r
+    return R
+
+
+
+
 def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique_trial_types, 
                        Adot_parcels_lev1_xr, Adot_parcels_lev2_xr,
                        cfg_img_recon = None, head = None, Adot = None,
                        flag_do_image_recon = False, flag_do_bp_filter_on_conc = True, flag_do_AR_filter_on_conc = 0, 
-                       flag_do_gms_chromo = True, flag_channels_to_parcels = False, flag_parcels_use_lev1 = False ):
+                       flag_do_gms_chromo = True, flag_channels_to_parcels = False, flag_parcels_use_lev1 = False, flag_do_robust = False):
     import statsmodels.api as sm
     from statsmodels.tsa.stattools import arma_order_select_ic
 
@@ -252,6 +325,14 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
             # get the OD time series
             od_ts = rec[idx_subj][idx_file]['od_corrected'].copy()
 
+            # get list of channels that we don't trust for estimating the variance
+            amp = rec[idx_subj][idx_file]['amp'].mean('time').min('wavelength') # take the minimum across wavelengths
+            idx_amp = np.where(amp < cfg_blockavg['cfg_mse_od']['mse_amp_thresh'])[0]
+            idx_sat = np.where(chs_pruned_subjs[idx_subj][idx_file] == 0.0)[0] 
+            idx_bad_channels = np.concatenate((idx_amp, idx_sat))
+            idx_bad_channels = np.sort(idx_bad_channels)
+            idx_bad_channels = rec[idx_subj][idx_file]['amp'].channel[idx_bad_channels].values                    
+
             # convert to conc in channel space or image space
             if not flag_do_image_recon:
                 dpf = xr.DataArray(
@@ -261,30 +342,53 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
                 )
                 conc_ts = cedalion.nirs.od2conc(od_ts, rec[idx_subj][idx_file].geo3d, dpf, spectrum="prahl")
 
-                # get the variance 
-                conc_var = conc_ts.var('time') + cfg_blockavg['cfg_mse_conc']['mse_min_thresh'] # set a small value to avoid dominance for low variance channels
-
-                # correct for bad data
-                amp = rec[idx_subj][idx_file]['amp'].mean('time').min('wavelength') # take the minimum across wavelengths
-                idx_amp = np.where(amp < cfg_blockavg['cfg_mse_od']['mse_amp_thresh'])[0]
-                conc_var.loc[dict(channel=conc_ts.isel(channel=idx_amp).channel.data)] = cfg_blockavg['cfg_mse_conc']['mse_val_for_bad_data']
+                # get the variance, correcting channels we don't trust (saturated, low amp, and low var)
+                conc_var = quality.measurement_variance(
+                        conc_ts,
+                        list_bad_channels = idx_bad_channels,
+                        bad_rel_var = 1e6, # If bad_abs_var is none then it uses this value relative to maximum variance
+                        bad_abs_var = None, #cfg_blockavg['cfg_mse_conc']['mse_val_for_bad_data'],
+                        calc_covariance = False
+                    )
+                conc_var = conc_var + cfg_blockavg['cfg_mse_conc']['mse_min_thresh'] # set a small value to avoid dominance for low variance channels
                 conc_ts.loc[dict(channel=conc_ts.isel(channel=idx_amp).channel.data)] = cfg_blockavg['cfg_mse_conc']['blockaverage_val']
-
-                idx_sat = np.where(chs_pruned_subjs[idx_subj][idx_file] == 0.0)[0] 
-                conc_var.loc[dict(channel=conc_ts.isel(channel=idx_sat).channel.data)] = cfg_blockavg['cfg_mse_conc']['mse_val_for_bad_data']
                 conc_ts.loc[dict(channel=conc_ts.isel(channel=idx_sat).channel.data)] = cfg_blockavg['cfg_mse_conc']['blockaverage_val']
+                #     # FIXME can delete once I trust new code
+                    # conc_var = conc_ts.var('time') + cfg_blockavg['cfg_mse_conc']['mse_min_thresh'] # set a small value to avoid dominance for low variance channels
+ 
+                    # # correct for bad data
+                    # amp = rec[idx_subj][idx_file]['amp'].mean('time').min('wavelength') # take the minimum across wavelengths
+                    # idx_amp = np.where(amp < cfg_blockavg['cfg_mse_od']['mse_amp_thresh'])[0]
+                    # conc_var.loc[dict(channel=conc_ts.isel(channel=idx_amp).channel.data)] = cfg_blockavg['cfg_mse_conc']['mse_val_for_bad_data']
+                    # conc_ts.loc[dict(channel=conc_ts.isel(channel=idx_amp).channel.data)] = cfg_blockavg['cfg_mse_conc']['blockaverage_val']
+
+                    # idx_sat = np.where(chs_pruned_subjs[idx_subj][idx_file] == 0.0)[0] 
+                    # conc_var.loc[dict(channel=conc_ts.isel(channel=idx_sat).channel.data)] = cfg_blockavg['cfg_mse_conc']['mse_val_for_bad_data']
+                    # conc_ts.loc[dict(channel=conc_ts.isel(channel=idx_sat).channel.data)] = cfg_blockavg['cfg_mse_conc']['blockaverage_val']
 
             else:
-                C_meas = od_ts.var('time') + cfg_blockavg['cfg_mse_od']['mse_min_thresh'] # set a small value to avoid dominance for low variance channels
-                # correct for bad data
-                amp = rec[idx_subj][idx_file]['amp'].mean('time').min('wavelength') # take the minimum across wavelengths
-                idx_amp = np.where(amp < cfg_blockavg['cfg_mse_od']['mse_amp_thresh'])[0]
-                C_meas.loc[dict(channel=amp.isel(channel=idx_amp).channel.data)] = cfg_blockavg['cfg_mse_conc']['mse_val_for_bad_data']
-                od_ts.loc[dict(channel=amp.isel(channel=idx_amp).channel.data)] = cfg_blockavg['cfg_mse_conc']['blockaverage_val']
+                # get the variance, correcting channels we don't trust (saturated, low amp, and low var)
+                C_meas = quality.measurement_variance(
+                        od_ts,
+                        list_bad_channels = idx_bad_channels,
+                        bad_rel_var = 1e6, # If bad_abs_var is none then it uses this value
+                        bad_abs_var = cfg_blockavg['cfg_mse_od']['mse_val_for_bad_data'],
+                        calc_covariance = False
+                    )
+                C_meas = C_meas + cfg_blockavg['cfg_mse_od']['mse_min_thresh'] # set a small value to avoid dominance for low variance channels
+                od_ts.loc[dict(channel=od_ts.isel(channel=idx_amp).channel.data)] = cfg_blockavg['cfg_mse_od']['blockaverage_val']
+                od_ts.loc[dict(channel=od_ts.isel(channel=idx_sat).channel.data)] = cfg_blockavg['cfg_mse_od']['blockaverage_val']
+                # # FIXME can delete once I trust new code above
+                # C_meas = od_ts.var('time') + cfg_blockavg['cfg_mse_od']['mse_min_thresh'] # set a small value to avoid dominance for low variance channels
+                # # correct for bad data
+                # amp = rec[idx_subj][idx_file]['amp'].mean('time').min('wavelength') # take the minimum across wavelengths
+                # idx_amp = np.where(amp < cfg_blockavg['cfg_mse_od']['mse_amp_thresh'])[0]
+                # C_meas.loc[dict(channel=amp.isel(channel=idx_amp).channel.data)] = cfg_blockavg['cfg_mse_conc']['mse_val_for_bad_data']
+                # od_ts.loc[dict(channel=amp.isel(channel=idx_amp).channel.data)] = cfg_blockavg['cfg_mse_conc']['blockaverage_val']
 
-                idx_sat = np.where(chs_pruned_subjs[idx_subj][idx_file] == 0.0)[0] 
-                C_meas.loc[dict(channel=amp.isel(channel=idx_sat).channel.data)] = cfg_blockavg['cfg_mse_conc']['mse_val_for_bad_data']
-                od_ts.loc[dict(channel=amp.isel(channel=idx_sat).channel.data)] = cfg_blockavg['cfg_mse_conc']['blockaverage_val']
+                # idx_sat = np.where(chs_pruned_subjs[idx_subj][idx_file] == 0.0)[0] 
+                # C_meas.loc[dict(channel=amp.isel(channel=idx_sat).channel.data)] = cfg_blockavg['cfg_mse_conc']['mse_val_for_bad_data']
+                # od_ts.loc[dict(channel=amp.isel(channel=idx_sat).channel.data)] = cfg_blockavg['cfg_mse_conc']['blockaverage_val']
 
                 # for od_ts stack the wavelength and channel dimension to measurement dimension
                 od_ts_stacked = od_ts.stack(measurement=("wavelength", "channel")).reset_index("measurement")
@@ -300,7 +404,8 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
 
                 # get conc_var from the image reconstruction
                 conc_var = img_recon.get_image_noise(C_meas, X_ts, W, DIRECT = cfg_img_recon['DIRECT'], SB= cfg_img_recon['SB'], G=G)
-
+                # FIXME I want to use cfg_blockavg['cfg_mse_od']['mse_min_thresh'], but this is micromolar and the conc_var seems to be molar
+                conc_var = xr.where(conc_var == 0, 1e6, conc_var)  # replace 0 with a large value because the data is bad
 
             # projecting vertices to parcels
             # but only do this before BP, AR and GMS if also doing image recon
@@ -314,10 +419,6 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
                 conc_var = 1 / w.groupby('parcel').sum('vertex')
 
                 # remove the 3 non-brain parcels
-                # FIXME can remove these 3 lines after testing
-                # conc_ts = conc_ts.sel(parcel=conc_ts.parcel != 'scalp')
-                # conc_ts = conc_ts.sel(parcel=conc_ts.parcel != 'Background+FreeSurfer_Defined_Medial_Wall_LH')
-                # conc_ts = conc_ts.sel(parcel=conc_ts.parcel != 'Background+FreeSurfer_Defined_Medial_Wall_RH')
                 conc_ts = conc_ts.sel(parcel=~conc_ts.parcel.isin([
                     'scalp',
                     'Background+FreeSurfer_Defined_Medial_Wall_LH',
@@ -345,9 +446,23 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
                 conc_var = conc_var.assign_coords(parcel=("parcel", parcel_list_lev))
                 w = 1 / conc_var
                 tsw = w * conc_ts
-                conc_ts = tsw.groupby('parcel').sum('parcel') / w.groupby('parcel').sum('parcel')
-                conc_var = 1 / w.groupby('parcel').sum('parcel')
+                if 1: # this was losing chromo coordinate... curious as it used to work
+                    # conc_ts = tsw.groupby('parcel').sum('parcel') / w.groupby('parcel').sum('parcel')
+                    # conc_var = 1 / w.groupby('parcel').sum('parcel')
+                    w_sum   = w.groupby('parcel').sum()
+                    tsw_sum = tsw.groupby('parcel').sum()
+                    # FIX: restore chromo coordinate
+                    tsw_sum = tsw_sum.assign_coords(chromo=tsw.chromo)
+                    w_sum   = w_sum.assign_coords(chromo=w.chromo)
 
+                    conc_ts  = tsw_sum / w_sum
+                    conc_var = 1.0 / w_sum
+                else:
+                    conc_ts = tsw.sum(dim='parcel') / w.sum(dim='parcel')
+                    conc_var = 1 / w.sum('parcel')
+                    # conc_ts = tsw.groupby(['chromo', 'parcel']).sum('parcel') / \
+                    #         w.groupby(['chromo', 'parcel']).sum('parcel')                    
+                    # conc_var = 1 / w.groupby(['chromo', 'parcel']).sum('parcel')
 
             # bandpass filter the time series
             if flag_do_bp_filter_on_conc:
@@ -397,20 +512,52 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
                 conc_ts = conc_ts_tmp.copy()
 
 
-            # Global mean subtraction for each chromo
-            if flag_do_gms_chromo:
-                # get the weighted mean by variance
-                gms = (conc_ts / conc_var).mean('channel') / (1/conc_var).mean('channel')
+            # GLOBAL PRE-WEIGHTING
+            global_w_hbo = global_preweight(conc_ts.sel(chromo='HbO').values )
+            global_w_hbr = global_preweight(conc_ts.sel(chromo='HbR').values )
+            global_w_xr = xr.DataArray(
+                np.vstack([global_w_hbo, global_w_hbr]),
+                dims=["chromo", "time"],
+                coords={"chromo": conc_ts.chromo, "time": conc_ts.time}
+            )
 
-                # fit GMS to the channel data and subtract it
-                numerator = (conc_ts * gms).sum(dim="time")
-                denominator = (gms * gms).sum(dim="time")
-                scl = numerator / denominator
-                conc_ts = conc_ts - scl*gms
+
+            # Global mean subtraction for each chromo
+            # FIXME handle if parcel or channel
+            if flag_do_gms_chromo:
+                if 'parcel' in conc_ts.dims:
+                    ts_dim = 'parcel'
+                elif 'channel' in conc_ts.dims:
+                    ts_dim = 'channel'
+                elif 'vertex' in conc_ts.dims:
+                    ts_dim = 'vertex'
+                else:
+                    raise ValueError("Input data must have dimension 'parcel', 'channel', or 'vertex'")
+
+                if 1: # FIXME: can't use this until global_component_subtract is updated to ts_weights with a temporal dimension for global_w_xr
+                      # Note that the fix is only needed for PCA regression, not GMS
+                    conc_ts, _ = global_component_subtract(
+                            conc_ts,
+                            channel_weights = 1/conc_var,
+                            temporal_weights = global_w_xr,
+                            spatial_dim = ts_dim,
+                            k = 1 # k is the number of PCA components to remove, 0 means do GMS
+                        )
+                else:
+                    # FIXME this is my old way of doing it. Remove this once comfortable with new cedalion code
+                    # get the weighted mean by variance
+                    gms = (conc_ts / conc_var).mean('channel') / (1/conc_var).mean('channel')
+
+                    # fit GMS to the channel data and subtract it
+                    numerator = (conc_ts * gms).sum(dim="time")
+                    denominator = (gms * gms).sum(dim="time")
+                    scl = numerator / denominator
+                    conc_ts = conc_ts - scl*gms
 
 
             # project channels to parcels
             # we do this here for channel space data (i.e. no image recon)
+            # FIXME: I should probably just remove this. OR fix it because of the PRE-WEIGHTING I do above from Huppert 2022
             if not flag_do_image_recon and flag_channels_to_parcels: # project channels to parcel_lev2 by weighted average over channels
                 w = 1 / conc_var
                 # get the normalized weighted averaging kernel
@@ -459,12 +606,17 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
                     foo_ts = conc_ts.copy()
 
                 # get the correlation matrix for assessing repeatability
-                corr_hbo = np.corrcoef( foo_ts.sel(chromo='HbO').values, rowvar=True )
-                corr_hbr = np.corrcoef( foo_ts.sel(chromo='HbR').values, rowvar=True )
+                if not flag_do_robust: # not Robust
+                    corr_hbo = np.corrcoef( foo_ts.sel(chromo='HbO').values, rowvar=True )
+                    corr_hbr = np.corrcoef( foo_ts.sel(chromo='HbR').values, rowvar=True )
+                else: # Robust
+                    corr_hbo = robust_pearson_corrcoef( foo_ts.sel(chromo='HbO').values, global_w_hbo)
+                    corr_hbr = robust_pearson_corrcoef( foo_ts.sel(chromo='HbR').values, global_w_hbr)
 
                 # store results 
                 # concatenate the time series and variance for each trial type for subsequent corrcoef in next cell
                 # store corrcoef for each file for repeatability
+                # FIXME: undo PRE-WEIGHTING 
                 if idx_file == 0:
                     conc_ts_files[trial_type] = foo_ts
                     conc_var_files[trial_type] = conc_var.copy()
@@ -520,16 +672,26 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
             mean_hbo = foo_hbo[np.triu_indices(foo_hbo.shape[0], k=1)].mean()
             mean_hbr = foo_hbr[np.triu_indices(foo_hbr.shape[0], k=1)].mean()
 
-            da_hbo = xr.DataArray(
-                mean_hbo,
-                dims=["subj","trial_type","chromo"],
-                coords={"trial_type": [trial_type], "chromo": ["HbO"], "subj": [curr_subj]}
-            )
-            da_hbr = xr.DataArray(
-                mean_hbr,
-                dims=["subj","trial_type","chromo"],
-                coords={"trial_type": [trial_type], "chromo": ["HbR"], "subj": [curr_subj]}
-            )
+            da_hbo = xr.DataArray(mean_hbo).expand_dims(
+                subj=[curr_subj],
+                trial_type=[trial_type],
+                chromo=["HbO"]
+            ).transpose("subj", "trial_type", "chromo")
+
+            da_hbr = xr.DataArray(mean_hbr).expand_dims(
+                subj=[curr_subj],
+                trial_type=[trial_type],
+                chromo=["HbR"]
+            ).transpose("subj", "trial_type", "chromo")            # da_hbo = xr.DataArray(
+            #     mean_hbo,
+            #     dims=["subj","trial_type","chromo"],
+            #     coords={"trial_type": [trial_type], "chromo": ["HbO"], "subj": [curr_subj]}
+            # )
+            # da_hbr = xr.DataArray(
+            #     mean_hbr,
+            #     dims=["subj","trial_type","chromo"],
+            #     coords={"trial_type": [trial_type], "chromo": ["HbR"], "subj": [curr_subj]}
+            # )
             if idx_trial_type == 0:
                 repeatability_trial_type_mean = xr.concat([da_hbo, da_hbr], dim="chromo")
             else:
@@ -540,16 +702,27 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
             mean_hbo = foo_hbo[np.triu_indices(foo_hbo.shape[0], k=1)].std()
             mean_hbr = foo_hbr[np.triu_indices(foo_hbr.shape[0], k=1)].std()
 
-            da_hbo = xr.DataArray(
-                mean_hbo,
-                dims=["subj","trial_type","chromo"],
-                coords={"trial_type": [trial_type], "chromo": ["HbO"], "subj": [curr_subj]}
-            )
-            da_hbr = xr.DataArray(
-                mean_hbr,
-                dims=["subj","trial_type","chromo"],
-                coords={"trial_type": [trial_type], "chromo": ["HbR"], "subj": [curr_subj]}
-            )
+            da_hbo = xr.DataArray(mean_hbo).expand_dims(
+                subj=[curr_subj],
+                trial_type=[trial_type],
+                chromo=["HbO"]
+            ).transpose("subj", "trial_type", "chromo")
+
+            da_hbr = xr.DataArray(mean_hbr).expand_dims(
+                subj=[curr_subj],
+                trial_type=[trial_type],
+                chromo=["HbR"]
+            ).transpose("subj", "trial_type", "chromo")            
+            # da_hbo = xr.DataArray(
+            #     mean_hbo,
+            #     dims=["subj","trial_type","chromo"],
+            #     coords={"trial_type": [trial_type], "chromo": ["HbO"], "subj": [curr_subj]}
+            # )
+            # da_hbr = xr.DataArray(
+            #     mean_hbr,
+            #     dims=["subj","trial_type","chromo"],
+            #     coords={"trial_type": [trial_type], "chromo": ["HbR"], "subj": [curr_subj]}
+            # )
             if idx_trial_type == 0:
                 repeatability_trial_type_std = xr.concat([da_hbo, da_hbr], dim="chromo")
             else:
@@ -568,10 +741,23 @@ def preprocess_dataset( rec, chs_pruned_subjs, cfg_dataset, cfg_blockavg, unique
 
 
 
-def get_correlation_matrices( conc_ts_subjs, conc_var_subjs, cfg_dataset, unique_trial_types ):
+def get_correlation_matrices( conc_ts_subjs, conc_var_subjs, cfg_dataset, unique_trial_types, flag_do_robust = False):
 
     corr_subj = {}
     corr_subj_var = {}
+
+    # Check that the data has dimension 'parcel'
+    if 'parcel' in conc_ts_subjs[0][unique_trial_types[0]].dims:
+        n_ch_or_parcel = conc_ts_subjs[0][unique_trial_types[0]].parcel.size
+        correlation_coord = conc_ts_subjs[0][unique_trial_types[0]].parcel.values
+    elif 'channel' in conc_ts_subjs[0][unique_trial_types[0]].dims:
+        n_ch_or_parcel = conc_ts_subjs[0][unique_trial_types[0]].channel.size
+        correlation_coord = conc_ts_subjs[0][unique_trial_types[0]].channel.values
+    elif 'vertex' in conc_ts_subjs[0][unique_trial_types[0]].dims:
+        n_ch_or_parcel = conc_ts_subjs[0][unique_trial_types[0]].vertex.size
+        correlation_coord = conc_ts_subjs[0][unique_trial_types[0]].vertex.values
+    else:
+        raise ValueError("Input data must have dimension 'parcel', 'channel', or 'vertex'")
 
     # Loop over subjects
     for idx_subj, curr_subj in enumerate(cfg_dataset['subj_ids']):
@@ -581,26 +767,59 @@ def get_correlation_matrices( conc_ts_subjs, conc_var_subjs, cfg_dataset, unique
         # loop over trial types
         for idx_trial_type, trial_type in enumerate(unique_trial_types):
 
+            # GLOBAL PRE-WEIGHTING
+            global_w_hbo = global_preweight(conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbO').values )
+            global_w_hbr = global_preweight(conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbR').values )
+            # global_w_xr = xr.DataArray(
+            #     np.vstack([global_w_hbo, global_w_hbr]),
+            #     dims=["chromo", "time"],
+            #     coords={"chromo": conc_ts_subjs[idx_subj][trial_type].chromo, "time": conc_ts_subjs[idx_subj][trial_type].time}
+            # )
+
             # get the correlation matrix
-            if 1:
+            if not flag_do_robust: # not Robust
                 corr_hbo = np.corrcoef( conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbO').values, rowvar=True )
                 corr_hbr = np.corrcoef( conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbR').values, rowvar=True )
-            else:
-                corr_hbo = np.corrcoef( np.nan_to_num(conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbO').values,nan=0.0, posinf=0.0, neginf=0.0), rowvar=True )
-                corr_hbr = np.corrcoef( np.nan_to_num(conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbR').values,nan=0.0, posinf=0.0, neginf=0.0), rowvar=True )
+            else: # Robust
+                corr_hbo = robust_pearson_corrcoef( conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbO').values, global_w_hbo)
+                corr_hbr = robust_pearson_corrcoef( conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbR').values, global_w_hbr)
+
+            # # get the correlation matrix
+            # if 1:
+            #     corr_hbo = np.corrcoef( conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbO').values, rowvar=True )
+            #     corr_hbr = np.corrcoef( conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbR').values, rowvar=True )
+            # else:
+            #     corr_hbo = np.corrcoef( np.nan_to_num(conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbO').values,nan=0.0, posinf=0.0, neginf=0.0), rowvar=True )
+            #     corr_hbr = np.corrcoef( np.nan_to_num(conc_ts_subjs[idx_subj][trial_type].sel(chromo='HbR').values,nan=0.0, posinf=0.0, neginf=0.0), rowvar=True )
 
 
             # get the correlation matrix for each subject
             da_hbo = xr.DataArray(
-                corr_hbo.reshape(1,1,1,-1),
-                dims=["subj", "trial_type", "chromo", "correlation"],
-                coords={"chromo": ["HbO"], "trial_type": [trial_type], "subj": [curr_subj]}
-            )
+                    corr_hbo.reshape(1,1,1,n_ch_or_parcel,n_ch_or_parcel),
+                    dims=["subj", "trial_type", "chromo", "correlation_A", "correlation_B"],
+                    coords={"chromo": ["HbO"], "trial_type": [trial_type], 
+                        "subj": [curr_subj], 
+                        "correlation_A": correlation_coord, 
+                        "correlation_B": correlation_coord}
+                )
             da_hbr = xr.DataArray(
-                corr_hbr.reshape(1,1,1,-1),
-                dims=["subj", "trial_type", "chromo", "correlation"],
-                coords={"chromo": ["HbR"], "trial_type": [trial_type], "subj": [curr_subj]}
-            )
+                    corr_hbr.reshape(1,1,1,n_ch_or_parcel,n_ch_or_parcel),
+                    dims=["subj", "trial_type", "chromo", "correlation_A", "correlation_B"],
+                    coords={"chromo": ["HbR"], "trial_type": [trial_type], 
+                        "subj": [curr_subj], 
+                        "correlation_A": correlation_coord, 
+                        "correlation_B": correlation_coord}
+                )
+            # da_hbo = xr.DataArray(
+            #     corr_hbo.reshape(1,1,1,-1),
+            #     dims=["subj", "trial_type", "chromo", "correlation"],
+            #     coords={"chromo": ["HbO"], "trial_type": [trial_type], "subj": [curr_subj]}
+            # )
+            # da_hbr = xr.DataArray(
+            #     corr_hbr.reshape(1,1,1,-1),
+            #     dims=["subj", "trial_type", "chromo", "correlation"],
+            #     coords={"chromo": ["HbR"], "trial_type": [trial_type], "subj": [curr_subj]}
+            # )
             if idx_trial_type == 0:
                 da_chromo = xr.concat([da_hbo, da_hbr], dim="chromo")
             else:
@@ -609,15 +828,31 @@ def get_correlation_matrices( conc_ts_subjs, conc_var_subjs, cfg_dataset, unique
 
             # get the variance of each element in the correlation matrix
             da_hbo = xr.DataArray(
-                (conc_var_subjs[idx_subj][trial_type].sel(chromo='HbO').values[:, np.newaxis] + conc_var_subjs[idx_subj][trial_type].sel(chromo='HbO').values[:, np.newaxis].T).reshape(1,1,1,-1),
-                dims=["subj", "trial_type", "chromo", "correlation"],
-                coords={"chromo": ["HbO"], "trial_type": [trial_type], "subj": [curr_subj]}
-            )
+                    (conc_var_subjs[idx_subj][trial_type].sel(chromo='HbO').values[:, np.newaxis] + conc_var_subjs[idx_subj][trial_type].sel(chromo='HbO').values[:, np.newaxis].T).reshape(1,1,1,n_ch_or_parcel,n_ch_or_parcel),
+                    dims=["subj", "trial_type", "chromo", "correlation_A", "correlation_B"],
+                    coords={"chromo": ["HbO"], "trial_type": [trial_type], 
+                        "subj": [curr_subj], 
+                        "correlation_A": correlation_coord, 
+                        "correlation_B": correlation_coord}
+                )
             da_hbr = xr.DataArray(
-                (conc_var_subjs[idx_subj][trial_type].sel(chromo='HbR').values[:, np.newaxis] + conc_var_subjs[idx_subj][trial_type].sel(chromo='HbR').values[:, np.newaxis].T).reshape(1,1,1,-1),
-                dims=["subj", "trial_type", "chromo", "correlation"],
-                coords={"chromo": ["HbR"], "trial_type": [trial_type], "subj": [curr_subj]}
-            )
+                    (conc_var_subjs[idx_subj][trial_type].sel(chromo='HbR').values[:, np.newaxis] + conc_var_subjs[idx_subj][trial_type].sel(chromo='HbR').values[:, np.newaxis].T).reshape(1,1,1,n_ch_or_parcel,n_ch_or_parcel),
+                    dims=["subj", "trial_type", "chromo", "correlation_A", "correlation_B"],
+                    coords={"chromo": ["HbR"], "trial_type": [trial_type], 
+                        "subj": [curr_subj], 
+                        "correlation_A": correlation_coord, 
+                        "correlation_B": correlation_coord}
+                )
+            # da_hbo = xr.DataArray(
+            #     (conc_var_subjs[idx_subj][trial_type].sel(chromo='HbO').values[:, np.newaxis] + conc_var_subjs[idx_subj][trial_type].sel(chromo='HbO').values[:, np.newaxis].T).reshape(1,1,1,-1),
+            #     dims=["subj", "trial_type", "chromo", "correlation"],
+            #     coords={"chromo": ["HbO"], "trial_type": [trial_type], "subj": [curr_subj]}
+            # )
+            # da_hbr = xr.DataArray(
+            #     (conc_var_subjs[idx_subj][trial_type].sel(chromo='HbR').values[:, np.newaxis] + conc_var_subjs[idx_subj][trial_type].sel(chromo='HbR').values[:, np.newaxis].T).reshape(1,1,1,-1),
+            #     dims=["subj", "trial_type", "chromo", "correlation"],
+            #     coords={"chromo": ["HbR"], "trial_type": [trial_type], "subj": [curr_subj]}
+            # )
             if idx_trial_type == 0:
                 da_chromo_var = xr.concat([da_hbo, da_hbr], dim="chromo")
             else:
@@ -636,14 +871,17 @@ def get_correlation_matrices( conc_ts_subjs, conc_var_subjs, cfg_dataset, unique
     return corr_subj, corr_subj_var
 
 
-def get_reliability(corr_subj, unique_trial_types):
+def get_reliability(corr_subj, unique_trial_types, flag_do_robust = False):
 
     # get the reliability
+    n_subjects = len(corr_subj.subj)
     reliability_mean = {}
     reliability_std = {}
+
     for idx_trial_type, trial_type in enumerate(unique_trial_types):
-        foo_hbo = np.corrcoef(np.nan_to_num(corr_subj.sel(chromo='HbO',trial_type=trial_type).values), rowvar=True)
-        foo_hbr = np.corrcoef(np.nan_to_num(corr_subj.sel(chromo='HbR',trial_type=trial_type).values), rowvar=True)
+        
+        foo_hbo = np.corrcoef(np.nan_to_num(corr_subj.sel(chromo='HbO',trial_type=trial_type).values.reshape(n_subjects,-1)), rowvar=True)
+        foo_hbr = np.corrcoef(np.nan_to_num(corr_subj.sel(chromo='HbR',trial_type=trial_type).values.reshape(n_subjects,-1)), rowvar=True)
 
         # get the mean reliability of the correlation matrix
         da_hbo = xr.DataArray(
@@ -684,6 +922,7 @@ def get_reliability(corr_subj, unique_trial_types):
 
 def group_correlation_matrices(corr_subj, corr_subj_var, unique_trial_types):
     # This is old... better to use the boot strapping method below
+    # FIXME we can delete this function... just here for now for reference
 
     # z-transform the correlation matrix across subjects using Fisher's z-transform
     corrz_hbo_subj_mean = {}
@@ -727,13 +966,6 @@ def group_correlation_matrices(corr_subj, corr_subj_var, unique_trial_types):
 
 def boot_strap_corr(corr_subj, corr_subj_var,trial_type_list, trial_type_diff=None):
 
-    z_boot_mean_hbo = {}
-    z_boot_mean_hbr = {}
-    z_boot_se_hbo = {}
-    z_boot_se_hbr = {}
-    r_boot_mean_hbo = {}
-    r_boot_mean_hbr = {}
-
     if trial_type_diff is not None:
         if len(trial_type_diff) != 2:
             raise ValueError("trial_type_diff must contain exactly two trial types for difference calculation.")
@@ -750,20 +982,20 @@ def boot_strap_corr(corr_subj, corr_subj_var,trial_type_list, trial_type_diff=No
         n_boot = 1000  # number of bootstrap samples
 
         n_subjects = len(corr_subj.subj)
-        n_channels = int(np.sqrt(len(corr_subj.correlation)))
+        n_channels = int(len(corr_subj.correlation_A))
 
-        z_boot_samples_hbo = np.zeros((n_boot, n_channels*n_channels))
-        z_boot_samples_hbr = np.zeros((n_boot, n_channels*n_channels))
+        z_boot_samples_hbo = np.zeros((n_boot, n_channels, n_channels))
+        z_boot_samples_hbr = np.zeros((n_boot, n_channels, n_channels))
 
         for b in range(n_boot):
             # Resample subject indices with replacement
             boot_indices = np.random.choice(n_subjects, size=n_subjects, replace=True)
 
-            z_weighted_sum_hbo = np.zeros((n_channels*n_channels))
-            weight_sum_hbo = np.zeros((n_channels*n_channels))
+            z_weighted_sum_hbo = np.zeros((n_channels, n_channels))
+            weight_sum_hbo = np.zeros((n_channels, n_channels))
 
-            z_weighted_sum_hbr = np.zeros((n_channels*n_channels))
-            weight_sum_hbr = np.zeros((n_channels*n_channels))
+            z_weighted_sum_hbr = np.zeros((n_channels, n_channels))
+            weight_sum_hbr = np.zeros((n_channels, n_channels))
 
             for idx in boot_indices:
                 if trial_type != trial_type_diff_str:
@@ -809,8 +1041,8 @@ def boot_strap_corr(corr_subj, corr_subj_var,trial_type_list, trial_type_diff=No
                     np.mean(z_boot_samples_hbo, axis=0),
                     np.mean(z_boot_samples_hbr, axis=0)
                 ]),
-                dims=["chromo", "correlation"],
-                coords={"chromo": ["HbO", "HbR"]}
+                dims=["chromo", "correlation_A", "correlation_B"],
+                coords={"chromo": ["HbO", "HbR"], "correlation_A": corr_subj.correlation_A.values, "correlation_B": corr_subj.correlation_B.values}
             )
             z_boot_mean = z_boot_mean.expand_dims(dim={"trial_type": [trial_type]})
         else:
@@ -819,8 +1051,8 @@ def boot_strap_corr(corr_subj, corr_subj_var,trial_type_list, trial_type_diff=No
                     np.mean(z_boot_samples_hbo, axis=0),
                     np.mean(z_boot_samples_hbr, axis=0)
                 ]),
-                dims=["chromo", "correlation"],
-                coords={"chromo": ["HbO", "HbR"]}
+                dims=["chromo", "correlation_A", "correlation_B"],
+                coords={"chromo": ["HbO", "HbR"], "correlation_A": corr_subj.correlation_A.values, "correlation_B": corr_subj.correlation_B.values}
             )
             new = new.expand_dims(dim={"trial_type": [trial_type]})
             z_boot_mean = xr.concat([z_boot_mean, new], dim="trial_type")
@@ -833,8 +1065,8 @@ def boot_strap_corr(corr_subj, corr_subj_var,trial_type_list, trial_type_diff=No
                     np.std(z_boot_samples_hbo, axis=0),
                     np.std(z_boot_samples_hbr, axis=0)
                 ]),
-                dims=["chromo", "correlation"],
-                coords={"chromo": ["HbO", "HbR"]}
+                dims=["chromo", "correlation_A", "correlation_B"],
+                coords={"chromo": ["HbO", "HbR"], "correlation_A": corr_subj.correlation_A.values, "correlation_B": corr_subj.correlation_B.values}
             )
             z_boot_se = z_boot_se.expand_dims(dim={"trial_type": [trial_type]})
         else:
@@ -843,17 +1075,17 @@ def boot_strap_corr(corr_subj, corr_subj_var,trial_type_list, trial_type_diff=No
                     np.std(z_boot_samples_hbo, axis=0),
                     np.std(z_boot_samples_hbr, axis=0)
                 ]),
-                dims=["chromo", "correlation"],
-                coords={"chromo": ["HbO", "HbR"]}
+                dims=["chromo", "correlation_A", "correlation_B"],
+                coords={"chromo": ["HbO", "HbR"], "correlation_A": corr_subj.correlation_A.values, "correlation_B": corr_subj.correlation_B.values}
             )
             new_se = new_se.expand_dims(dim={"trial_type": [trial_type]})
             z_boot_se = xr.concat([z_boot_se, new_se], dim="trial_type")
 
         # Confidence intervals (e.g. 95%)
-        z_ci_lower_hbo = np.percentile(z_boot_samples_hbo, 2.5, axis=0)
-        z_ci_upper_hbo = np.percentile(z_boot_samples_hbo, 97.5, axis=0)
-        z_ci_lower_hbr = np.percentile(z_boot_samples_hbr, 2.5, axis=0)
-        z_ci_upper_hbr = np.percentile(z_boot_samples_hbr, 97.5, axis=0)
+        # z_ci_lower_hbo = np.percentile(z_boot_samples_hbo, 2.5, axis=0)
+        # z_ci_upper_hbo = np.percentile(z_boot_samples_hbo, 97.5, axis=0)
+        # z_ci_lower_hbr = np.percentile(z_boot_samples_hbr, 2.5, axis=0)
+        # z_ci_upper_hbr = np.percentile(z_boot_samples_hbr, 97.5, axis=0)
 
         # Convert back to r-space if needed
         r_boot_mean = np.tanh(z_boot_mean)
@@ -866,70 +1098,73 @@ def boot_strap_corr(corr_subj, corr_subj_var,trial_type_list, trial_type_diff=No
     return z_boot_mean, z_boot_se, r_boot_mean
 
 
-def plot_correlation_matrix( r_boot_mean, z_boot_mean, z_boot_se, t_crit, trial_type, vminmax, corr_subj=None ):
+def plot_correlation_matrix( r_boot_mean, z_boot_mean, z_boot_se, t_crit, trial_type, vminmax, corr_subj=None, flag_show_which_axis=0 ):
 
-    # if 0: # mean across subjects
-    #     print(f"t_crit: {t_crit:.2f}")
-        # f, axs = p.subplots(2,2,figsize=(12,12))
-
-        # ax1 = axs[0][0]
-        # foo1 = corr_hbo_subj_mean[trial_type].copy()
-        # n_channels = int(np.sqrt(len(foo1)))
-        # ax1.imshow( foo1.reshape((n_channels,n_channels)), cmap='jet', vmin=-1, vmax=1)
-        # ax1.set_title('HbO Correlation Matrix')
-
-        # ax1 = axs[0][1]
-        # foo1 = corr_hbr_subj_mean[trial_type].copy()
-        # ax1.imshow( foo1.reshape((n_channels,n_channels)), cmap='jet', vmin=-1, vmax=1)
-        # ax1.set_title('HbR Correlation Matrix')
-
-        # ax1 = axs[1][0]
-        # foo = corr_hbo_subj_mean[trial_type] / (corr_hbo_subj_std[trial_type] / np.sqrt(n_subjects))
-        # foo1 = corr_hbo_subj_mean[trial_type].copy()
-        # foo1[np.abs(foo) < t_crit] = np.nan # remove non-significant correlations
-        # ax1.imshow( foo1.reshape((n_channels,n_channels)), cmap='jet', vmin=-1, vmax=1)
-
-        # ax1 = axs[1][1]
-        # foo = corr_hbr_subj_mean[trial_type] / (corr_hbr_subj_std[trial_type] / np.sqrt(n_subjects))
-        # foo1 = corr_hbr_subj_mean[trial_type].copy()
-        # foo1[np.abs(foo) < t_crit] = np.nan # remove non-significant correlations
-        # ax1.imshow( foo1.reshape((n_channels,n_channels)), cmap='jet', vmin=-1, vmax=1)
-
-    if corr_subj is None: # weighted mean across subjects
+    if corr_subj is None and flag_show_which_axis==0: # weighted mean across subjects
         f, axs = p.subplots(2,2,figsize=(12,8))
 
         ax1 = axs[0][0]
-        # foo1 = r_boot_mean_hbo[trial_type].copy()
         foo1 = r_boot_mean.sel(chromo='HbO', trial_type=trial_type).values
-        n_channels = int(np.sqrt(len(foo1)))
-        ax1.imshow( foo1.reshape((n_channels,n_channels)), cmap='jet', vmin=-vminmax, vmax=vminmax)
+        ax1.imshow( foo1, cmap='jet', vmin=-vminmax, vmax=vminmax)
         ax1.set_title('HbO Correlation Matrix')
 
         ax1 = axs[0][1]
-        # foo1 = r_boot_mean_hbr[trial_type].copy()
         foo1 = r_boot_mean.sel(chromo='HbR', trial_type=trial_type).values
-        ax1.imshow( foo1.reshape((n_channels,n_channels)), cmap='jet', vmin=-vminmax, vmax=vminmax)
+        ax1.imshow( foo1, cmap='jet', vmin=-vminmax, vmax=vminmax)
         ax1.set_title('HbR Correlation Matrix')
 
         ax1 = axs[1][0]
-        # foo = z_boot_mean_hbo[trial_type] / z_boot_se_hbo[trial_type]
-        # foo1 = r_boot_mean_hbo[trial_type].copy()
         foo = z_boot_mean.sel(chromo='HbO', trial_type=trial_type).values / \
             z_boot_se.sel(chromo='HbO', trial_type=trial_type).values
         foo1 = r_boot_mean.sel(chromo='HbO', trial_type=trial_type).copy().values
         foo1[np.abs(foo) < t_crit] = np.nan # remove non-significant correlations
-        ax1.imshow( foo1.reshape((n_channels,n_channels)), cmap='jet', vmin=-vminmax, vmax=vminmax)
+        ax1.imshow( foo1, cmap='jet', vmin=-vminmax, vmax=vminmax)
 
         ax1 = axs[1][1]
-        # foo = z_boot_mean_hbr[trial_type] / z_boot_se_hbr[trial_type]
-        # foo1 = r_boot_mean_hbr[trial_type].copy()
         foo = z_boot_mean.sel(chromo='HbR', trial_type=trial_type).values / \
             z_boot_se.sel(chromo='HbR', trial_type=trial_type).values
         foo1 = r_boot_mean.sel(chromo='HbR', trial_type=trial_type).copy().values
         foo1[np.abs(foo) < t_crit] = np.nan # remove non-significant correlations
-        ax1.imshow( foo1.reshape((n_channels,n_channels)), cmap='jet', vmin=-vminmax, vmax=vminmax)
+        ax1.imshow( foo1, cmap='jet', vmin=-vminmax, vmax=vminmax)
 
-    else: # each subject
+    if corr_subj is None and flag_show_which_axis>0: # each subject
+        f, axs = p.subplots(1,1,figsize=(24,16))
+
+        if flag_show_which_axis == 1:  # show HbO
+            foo1 = r_boot_mean.sel(chromo='HbO', trial_type=trial_type).values
+            axs.imshow(foo1, cmap='jet', vmin=-vminmax, vmax=vminmax)
+            axs.set_title('HbO Correlation Matrix')
+
+        elif flag_show_which_axis == 2:  # show HbR
+            foo1 = r_boot_mean.sel(chromo='HbR', trial_type=trial_type).values
+            axs.imshow(foo1, cmap='jet', vmin=-vminmax, vmax=vminmax)
+            axs.set_title('HbR Correlation Matrix')
+
+        elif flag_show_which_axis == 3:  # show HbO with t-stat threshold
+            foo = z_boot_mean.sel(chromo='HbO', trial_type=trial_type).values / \
+                z_boot_se.sel(chromo='HbO', trial_type=trial_type).values
+            foo1 = r_boot_mean.sel(chromo='HbO', trial_type=trial_type).copy().values
+            foo1[np.abs(foo) < t_crit] = np.nan  # remove non-significant correlations
+            axs.imshow(foo1, cmap='jet', vmin=-vminmax, vmax=vminmax)
+            axs.set_title('HbO Correlation Matrix')
+
+        elif flag_show_which_axis == 4:  # show HbR with t-stat threshold
+            foo = z_boot_mean.sel(chromo='HbR', trial_type=trial_type).values / \
+                z_boot_se.sel(chromo='HbR', trial_type=trial_type).values
+            foo1 = r_boot_mean.sel(chromo='HbR', trial_type=trial_type).copy().values
+            foo1[np.abs(foo) < t_crit] = np.nan  # remove non-significant correlations
+            axs.imshow(foo1, cmap='jet', vmin=-vminmax, vmax=vminmax)
+            axs.set_title('HbR Correlation Matrix')
+
+        # set X tick labels to corr_subj.correlation_A.values
+        axs.set_xticks(np.arange(len(r_boot_mean.correlation_A)))
+        axs.set_xticklabels(r_boot_mean.correlation_A.values, rotation=90)
+        # set Y tick labels to corr_subj.correlation_B.values
+        axs.set_yticks(np.arange(len(r_boot_mean.correlation_B)))
+        axs.set_yticklabels(r_boot_mean.correlation_B.values)
+
+
+    if corr_subj is not None: # each subject
         n_subjects = corr_subj.subj.size
         n_ch_or_parcel = int(np.sqrt(len(corr_subj.correlation)))
 
@@ -990,25 +1225,23 @@ def plot_connectivity_circle( r_boot_mean, z_boot_mean, z_boot_se, t_crit, trial
     # )
 
 
-
-
     if flag_show_hbo:
         # foo = z_boot_mean_hbo[trial_type] / z_boot_se_hbo[trial_type]
         # foo1 = r_boot_mean_hbo[trial_type].copy()
         foo = z_boot_mean.sel(chromo='HbO', trial_type=trial_type).values / \
             z_boot_se.sel(chromo='HbO', trial_type=trial_type).values
-        foo1 = r_boot_mean.sel(chromo='HbO', trial_type=trial_type).values
+        foo1 = r_boot_mean.sel(chromo='HbO', trial_type=trial_type).copy().values
     else:
         # foo = z_boot_mean_hbr[trial_type] / z_boot_se_hbr[trial_type]
         # foo1 = r_boot_mean_hbr[trial_type].copy()
         foo = z_boot_mean.sel(chromo='HbR', trial_type=trial_type).values / \
             z_boot_se.sel(chromo='HbR', trial_type=trial_type).values
-        foo1 = r_boot_mean.sel(chromo='HbR', trial_type=trial_type).values
+        foo1 = r_boot_mean.sel(chromo='HbR', trial_type=trial_type).copy().values
 
 
     foo1[np.abs(foo) < t_crit] = 0 #np.nan # remove non-significant correlations
-    foo1 = foo1.reshape((n_channels,n_channels))
-    foo = foo.reshape((n_channels,n_channels))
+    # foo1 = foo1.reshape((n_channels,n_channels))
+    # foo = foo.reshape((n_channels,n_channels))
 
 
 
