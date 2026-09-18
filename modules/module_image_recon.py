@@ -1,6 +1,6 @@
 import cedalion
-import cedalion.datasets as datasets
-import cedalion.imagereco.forward_model as fw
+import cedalion.data as datasets
+import cedalion.dot.forward_model as fw
 import cedalion.io as io
 import cedalion.nirs as nirs
 import xarray as xr
@@ -9,7 +9,7 @@ import cedalion.dataclasses as cdc
 import numpy as np
 import os.path
 import pickle
-from cedalion.imagereco.solver import pseudo_inverse_stacked
+#from cedalion.dot.solver import pseudo_inverse_stacked #FIXME updated image recon
 import cedalion.xrutils as xrutils
 
 import matplotlib.pyplot as p
@@ -50,7 +50,7 @@ def load_head_model(head_model='ICBM152', with_parcels=True):
         brain_surface_file= os.path.join(SEG_DATADIR, "mask_brain.obj"),
         scalp_surface_file= os.path.join(SEG_DATADIR, "mask_scalp.obj"),
         landmarks_ras_file=landmarks_file,
-        smoothing=0.5,
+        smoothing=0,
         fill_holes=True,
         parcel_file=PARCEL_DIR
     ) 
@@ -611,7 +611,7 @@ def do_image_recon_DB( hrf_od = None, head = None, Adot = None, C_meas = None, w
     print(f'   Doing image recon with alpha_meas = {alpha_meas}')
     if cfg_img_recon['BRAIN_ONLY'] and W is None:
         Adot_stacked = xr.DataArray(A, dims=("measurement", "flat_vertex"))
-        W = pseudo_inverse_stacked(Adot_stacked, alpha=alpha_meas)
+# FIXME NEW IMAGE RECON        W = pseudo_inverse_stacked(Adot_stacked, alpha=alpha_meas)
         W = W.assign_coords({"chromo" : ("flat_vertex", ["HbO"]*nvertices  + ["HbR"]* nvertices)})
         W = W.set_xindex("chromo")
     elif W is None:

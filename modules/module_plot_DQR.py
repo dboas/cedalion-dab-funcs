@@ -4,13 +4,12 @@ import cedalion
 import cedalion.nirs
 import cedalion.sigproc.quality as quality
 import cedalion.sigproc.frequency as frequency
-import cedalion.sigproc.motion_correct as motion_correct
+import cedalion.sigproc.motion as motion_correct
 import cedalion.xrutils as xrutils
-import cedalion.datasets as datasets
 import xarray as xr
 import matplotlib.pyplot as p
 import matplotlib.colors as clrs
-import cedalion.plots as plots
+import cedalion.vis as plots
 from cedalion import units
 import numpy as np
 

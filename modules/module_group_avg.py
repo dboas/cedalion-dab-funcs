@@ -8,7 +8,7 @@ import cedalion.nirs
 import cedalion.sigproc.quality as quality
 
 import cedalion.models.glm as glm
-import cedalion.plots as plots
+import cedalion.vis as plots
 
 from cedalion import units
 import numpy as np

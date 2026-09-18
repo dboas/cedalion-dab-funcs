@@ -16,18 +16,17 @@ Created on Fri Jan 24 14:37:57 2025
 import cedalion
 import cedalion.nirs
 import cedalion.xrutils as xrutils
-import cedalion.datasets as datasets
 import numpy as np
 import xarray as xr
 import pint
 import matplotlib.pyplot as plt
-import cedalion.plots as plots
+import cedalion.vis as plots
 from cedalion import units
 import scipy.signal
 import os.path
 import pandas as pd
-from cedalion.vis import plot_probe as vpp
-from cedalion.vis import time_series as vts
+from cedalion.vis.misc import plot_probe_gui as vpp
+from cedalion.vis.misc import time_series_gui as vts
 #from circle_probe_cedalion import plot_circle_probe
 from sklearn.linear_model import LinearRegression
 

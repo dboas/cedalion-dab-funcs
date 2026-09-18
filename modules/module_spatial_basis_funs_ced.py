@@ -15,14 +15,14 @@ import trimesh
 
 import cedalion
 import cedalion.dataclasses as cdc
-import cedalion.imagereco.forward_model as cfm
+import cedalion.dot.forward_model as cfm
 from cedalion.geometry.registration import register_trans_rot_isoscale
 import cedalion.typing as cdt
 import cedalion.xrutils as xrutils
 from cedalion.geometry.segmentation import surface_from_segmentation
-from cedalion.imagereco.utils import map_segmentation_mask_to_surface
+from cedalion.dot.utils import map_segmentation_mask_to_surface
 
-from cedalion.imagereco.tissue_properties import get_tissue_properties
+from cedalion.dot.tissue_properties import get_tissue_properties
 from tqdm import tqdm 
 
 #%% GETTING THE SPATIAL BASIS 

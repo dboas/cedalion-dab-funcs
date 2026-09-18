@@ -3,13 +3,12 @@ import cedalion
 import cedalion.nirs
 import cedalion.sigproc.quality as quality
 import cedalion.sigproc.frequency as frequency
-import cedalion.sigproc.motion_correct as motion_correct
+import cedalion.sigproc.motion as motion_correct
 import cedalion.xrutils as xrutils
 import cedalion.models.glm as glm
-import cedalion.datasets as datasets
 import xarray as xr
 import matplotlib.pyplot as p
-import cedalion.plots as plots
+import cedalion.vis as plots
 from cedalion import units
 import numpy as np
 import pandas as pd
@@ -20,7 +19,7 @@ import json
 # import my own functions from a different directory
 import sys
 import module_plot_DQR as pfDAB_dqr
-import module_imu_glm_filter as pfDAB_imu
+# import module_imu_glm_filter as pfDAB_imu
 
 import pdb
 
